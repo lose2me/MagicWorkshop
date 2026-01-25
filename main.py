@@ -521,7 +521,7 @@ class ProfileInterface(QWidget):
         card_layout.addStretch(1)
         
         # Avatar
-        avatar_path = resource_path("lemon404.ico")
+        avatar_path = resource_path("LingMoe404.ico")
         if os.path.exists(avatar_path):
             # 强制加载 256x256 的高清图标，避免默认加载小尺寸导致模糊
             pixmap = QIcon(avatar_path).pixmap(256, 256)
@@ -552,7 +552,7 @@ class ProfileInterface(QWidget):
         
         # Youtube
         btn_yt = PushButton("▶️ Youtube 观测站", self.card)
-        btn_yt.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://www.youtube.com/@LingMeng404")))
+        btn_yt.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://www.youtube.com/@LingMoe404")))
         btn_yt.setFixedWidth(280)
         btn_yt.setMinimumHeight(45)
         btn_yt.setStyleSheet("PushButton { background-color: #FF0000; color: white; border: none; border-radius: 8px; font-weight: bold; font-family: 'Microsoft YaHei'; } PushButton:hover { background-color: #FF4444; }")
@@ -566,7 +566,7 @@ class ProfileInterface(QWidget):
 
         # GitHub
         btn_github = PushButton("🐙 GitHub 异次元仓库", self.card)
-        btn_github.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/Lemon4289")))
+        btn_github.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://github.com/LingMoe404")))
         btn_github.setFixedWidth(280)
         btn_github.setMinimumHeight(45)
         btn_github.setStyleSheet("PushButton { background-color: #24292e; color: white; border: none; border-radius: 8px; font-weight: bold; font-family: 'Microsoft YaHei'; } PushButton:hover { background-color: #444c56; }")
@@ -1121,7 +1121,7 @@ class MainWindow(FluentWindow):
 if __name__ == '__main__':
     # 设置 AppUserModelID，将程序与 Python 解释器区分开，确保任务栏图标清晰且独立
     try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Lemon404.MagicWorkshop.Encoder.v1")
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LingMoe404.MagicWorkshop.Encoder.v1")
     except:
         pass
 
