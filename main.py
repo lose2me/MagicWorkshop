@@ -178,8 +178,7 @@ class EncoderWorker(QThread):
                     cmd_search.extend(["--temp-dir", cache_dir])
 
                 self.log_signal.emit(" -> 正在推演最强术式 (ab-av1)...", "info")
-                # 这里可以发送信号让 UI 进度条变成 indeterminate 模式，为了简化逻辑暂略
-
+                
                 best_icq = 24
                 search_success = False
                 
@@ -203,6 +202,10 @@ class EncoderWorker(QThread):
                                 best_icq = int(match.group(1))
                                 search_success = True
                     self.current_proc.wait()
+                    # 显式清理管道
+                    if self.current_proc.stdout: self.current_proc.stdout.close()
+                    if self.current_proc.stderr: self.current_proc.stderr.close()
+
                 except: pass
 
                 if not self.is_running: break
@@ -225,10 +228,10 @@ class EncoderWorker(QThread):
                     if not os.path.exists(export_dir): os.makedirs(export_dir, exist_ok=True)
                     final_dest = os.path.join(export_dir, base_name + ".mkv")
 
-                # [Fix] MP4/MOV 容器中的 mov_text 字幕无法直接 copy 到 MKV，需转为 srt
+                # [Fix] MP4/MOV 容器中的 mov_text 字幕无法直接 copy 到 MKV，需转为 srt/subrip
                 sub_codec = "copy"
                 if fname.lower().endswith(('.mp4', '.mov', '.m4v')):
-                    sub_codec = "srt"
+                    sub_codec = "subrip"
 
                 # [关键] 针对 Ultra 7 265T 优化的参数
                 cmd = [
@@ -237,6 +240,7 @@ class EncoderWorker(QThread):
                     "-i", filepath,
                     "-c:v", "av1_qsv", "-preset", preset,
                     "-global_quality:v", str(best_icq), 
+                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", # 确保分辨率为偶数，防止 QSV 报错
                     "-pix_fmt", "p010le",
                     "-async_depth", "1", # 修复显存溢出/Invalid FrameType
                     
@@ -281,6 +285,9 @@ class EncoderWorker(QThread):
                                 if len(err_log) > 20: err_log.pop(0)
                     
                     self.current_proc.wait()
+                    # [Fix] 显式关闭管道，释放句柄
+                    if self.current_proc.stdout: self.current_proc.stdout.close()
+                    if self.current_proc.stderr: self.current_proc.stderr.close()
 
                     if not self.is_running:
                         if os.path.exists(temp_file): os.remove(temp_file)
@@ -317,6 +324,11 @@ class EncoderWorker(QThread):
 
                 except Exception as e:
                     self.log_signal.emit(f" -> 魔力逆流: {e} (×_×)", "error")
+                
+                # [Fix] 冷却机制：强制休眠 3 秒，让 Intel 显卡驱动释放显存和句柄
+                if self.is_running:
+                    self.log_signal.emit(" -> 正在冷却魔术回路 (Cooling down GPU)...", "info")
+                    time.sleep(3)
 
             if self.is_running:
                 self.log_signal.emit(">>> 奇迹达成！(๑•̀ㅂ•́)و✧", "success")
