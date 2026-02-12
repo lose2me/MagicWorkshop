@@ -1,14 +1,14 @@
 # ✨ 魔法少女工坊 (Magic Workshop) - NAS Edition
 
-![Version](https://img.shields.io/badge/version-1.0.0-FB7299?style=for-the-badge&logo=bilibili&logoColor=white)
+![Version](https://img.shields.io/badge/version-1.1.0-FB7299?style=for-the-badge&logo=bilibili&logoColor=white)
 ![Built with Gemini](https://img.shields.io/badge/Built%20with-Gemini-8E75B2?style=for-the-badge&logo=googlegemini&logoColor=white)
 ![Platform](https://img.shields.io/badge/OS-Windows11-0078D6?style=for-the-badge&logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/License-GPLv3-green?style=for-the-badge)
 
-> **"NAS 媒体库洗版神器 · Intel Arc & Ultra 显卡专用"**
+> **"NAS 媒体库洗版神器 · Intel Arc & NVIDIA RTX 40 系列专用"**
 >
 > 专为 **NAS 用户** 和 **仓鼠党** 打造的 AV1 硬件转码工具。
-> 利用 Intel QSV (Quick Sync Video) 技术，在保留画质的前提下，将庞大的影视库体积缩小 **30% - 50%**。
+> 利用 Intel QSV 或 NVIDIA NVENC 技术，在保留画质的前提下，将庞大的影视库体积缩小 **30% - 50%**。
 > *Powered by Python, PyQt6, QFluentWidgets, FFmpeg, ab-av1, Gemini.*
 
 ---
@@ -20,8 +20,10 @@
 
 ## 🎯 核心功能
 
-*   **🚀 Intel QSV 硬件加速**: 专为 **Intel Arc (A380/A750/B580)等独显** 及 **Core Ultra (如 265T)** 核显优化，满血释放 `av1_qsv` 编码性能。
-*   **🧠 智能码率 (ab-av1)**: 集成 `ab-av1` 算法，根据设定的 VMAF 分数（如 93+）自动测算最佳压制参数 (ICQ)，支持 **10-bit** 深度，告别盲猜码率。
+*   **🚀 双核硬件加速**:
+    *   **Intel QSV**: 专为 Intel Arc (A380/A750/B580) 及 Core Ultra 核显优化，满血释放 `av1_qsv` 性能。
+    *   **NVIDIA NVENC**: **[New]** 支持 RTX 40 系列显卡 AV1 编码，内置 **AQ (感知画质增强)** 开关，画质更细腻。
+*   **🧠 智能码率 (ab-av1)**: 集成 `ab-av1` 算法，根据设定的 VMAF 分数（Intel 默认 93 / NVIDIA 默认 95）自动测算最佳压制参数，支持 **10-bit** 深度。
 *   **📂 批量洗版**: 支持选择整个文件夹，自动扫描视频文件并加入队列。支持断点续传，适合挂机处理 TB 级数据。
 *   **🔮 真理之眼**: 拖入视频文件即可快速查看详细媒体信息（编码、流信息、码率等），二次元风格报告。
 *   **🛠️ 媒体库友好**:
@@ -30,6 +32,22 @@
     *   **元数据**: 尽可能保留原文件的元数据信息。
 *   **🎨 Win11 风格**: 基于 `PyQt6-Fluent-Widgets` 开发，支持云母 (Mica) 特效与深色模式，界面精美。
 *   **🔌 贴心辅助**: 支持任务完成后**自动关机**，以及一键清理 ab-av1 产生的临时缓存文件。
+
+## 📊 编码器参数对比
+
+| 特性 / 参数 | Intel QSV (默认) | NVIDIA NVENC |
+| :--- | :--- | :--- |
+| **FFmpeg 编码器** | `av1_qsv` | `av1_nvenc` |
+| **默认 VMAF 目标** | `93.0` | `95.0` |
+| **质量控制参数** | `-global_quality:v` | `-cq` |
+| **速度预设 (Preset)** | `1` (慢) - `7` (快) | `p1` (慢) - `p7` (快) |
+| **码率控制模式** | 硬件 ICQ 模式 | `vbr` + `-b:v 0` (解除上限) |
+| **感知增强 (AQ)** | 不支持 | 支持 (Spatial/Temporal AQ) |
+| **像素格式** | `p010le` (10-bit) | `p010le` (10-bit) |
+| **特殊优化** | `-async_depth 1` (防溢出) | 自动开启感知增强开关 |
+| **硬件门槛** | Intel Arc / Core Ultra | NVIDIA RTX 40 系列 |
+
+*注：由于两家算法不同，相同的质量数值（如 30）在不同显卡上的表现不可直接类比，请以 VMAF 结果为准。*
 
 ## 🧪 VMAF 调优指南
 
@@ -42,28 +60,51 @@
 ## ⚙️ 系统要求
 
 *   **操作系统**: Windows 10 / 11 (推荐 Win11 以获得最佳 UI 体验)
-*   **显卡**: **必须** 是支持 AV1 硬件编码的 Intel 显卡
-    *   Intel Arc A380 / A750 / B580 等（独显）
-    *   Intel Core Ultra 系列 (核显)
-    *   *注意: NVIDIA 和 AMD 显卡暂不支持（代码中硬编码了 `av1_qsv`）*
-*   **驱动**: 请安装最新的 Intel 显卡驱动。
+*   **显卡**: **必须** 支持 AV1 硬件编码
+    *   🟢 **Intel**: Arc A380 / A750 / B580 等独显，或 Core Ultra 系列核显。
+    *   🟢 **NVIDIA**: GeForce RTX 40 系列 (如 RTX 4060 / 4080 / 4090)。
+    *   *注意: AMD 显卡及旧款 NVIDIA (30系及以下) 暂不支持。*
+*   **驱动**: 请安装最新的显卡驱动。
 
 ### 🔍 硬件兼容性自测
 程序启动时会自动检测环境（真实初始化硬件）。
 
 **软件内状态 (GUI Log):**
-*   **✅ 通过**: `>>> 适格者认证通过：Intel QSV 动力源同步率 100%！(Ready)`
-*   **❌ 失败**: `>>> 警告：未侦测到 Intel QSV AV1 魔力源...`
+*   **✅ 通过**: `>>> 适格者认证通过： [Intel QSV] [NVIDIA NVENC] (Ready)` (根据实际硬件显示)
+*   **❌ 失败**: `>>> 警告：未侦测到有效的 AV1 硬件编码器...`
 
 **手动确认 (Terminal):**
-如果您想手动确认，请在终端执行：
+如果您想手动确认，请在终端执行对应显卡的检测命令：
+
+**Intel QSV:**
 ```bash
-.\ffmpeg.exe -f lavfi -i color=s=128x128 -c:v av1_qsv -frames:v 1 -f null - -v error
+.\ffmpeg.exe -init_hw_device qsv=hw -f lavfi -i color=black:s=1280x720 -pix_fmt p010le -c:v av1_qsv -frames:v 1 -f null - -v error
 ```
-*   **无输出**: 恭喜！您的硬件完美支持 QSV AV1 硬件编码。
-*   **有输出 (报错)**: 说明您的显卡不支持 QSV AV1 或驱动未正确安装。
+**NVIDIA NVENC:**
+```bash
+.\ffmpeg.exe -f lavfi -i color=black:s=1280x720 -pix_fmt p010le -c:v av1_nvenc -frames:v 1 -f null - -v error
+```
+*   **无输出**: 恭喜！您的硬件完美支持 QSV or NVENC AV1 硬件编码。
+*   **有输出 (报错)**: 说明您的显卡不支持 QSV or NVENC AV1 或驱动未正确安装。
 
 ## 📥 下载与使用
+
+---
+
+## 🚀 更新日志
+
+*   **v1.1.0 (2026-02-13)**
+    *   💡 **新增 NVIDIA NVENC AV1 硬件编码支持** (需 RTX 40 系列)。
+    *   ⚙️ 优化硬件检测逻辑，区分显卡型号和驱动问题。
+    *   🚀 修复 `ab-av1` 参数兼容性问题，大幅提升 NVENC 压制画质 (开启 AQ 感知增强)。
+    *   📝 增加日志 VMAF 实时显示，NVENC 感知增强开关，以及 VMAF 默认值智能切换。
+
+*   **v1.0.0 (2026-01-28)**
+    *   🎉 首次发布！支持 Intel QSV AV1 硬件编码。
+    *   ✨ 集成 `ab-av1` 智能 VMAF 码率控制。
+    *   🎨 Win11 Fluent Design 风格界面。
+
+---
 
 ### 方式一：下载便携版 (推荐)
 
@@ -84,7 +125,7 @@
 
 1.  **克隆仓库**
     ```bash
-    git clone https://github.com/Lemon4289/MagicWorkshop.git
+    git clone https://github.com/LingMoe404/MagicWorkshop.git
     cd MagicWorkshop
     ```
 
@@ -109,7 +150,10 @@
 A: 说明程序目录下缺少 `ffmpeg.exe`、`ffprobe.exe` 或 `ab-av1.exe`。请下载这些工具并和 exe 放在一起。
 
 **Q: 为什么点击开始后直接报错/闪退？**
-A: 请检查您的显卡是否支持 Intel QSV AV1 编码。如果使用 NVIDIA & AMD 显卡，当前版本无法运行。
+A: 请检查您的显卡是否支持 AV1 硬件编码。
+   - **Intel**: 需要 Arc A380/A750/B580 或 Core Ultra 核显。
+   - **NVIDIA**: 需要 RTX 40 系列 (如 4060/4080/4090)。
+   - **AMD**: 暂不支持。
 
 **Q: 转换后的 MKV 字幕显示不正常？**
 A: 程序会自动判断：如果是 MP4 源文件，字幕会转为 SRT 以兼容 MKV；如果是 MKV 源文件，则保留原始字幕（如 ASS 特效）。
@@ -117,7 +161,7 @@ A: 程序会自动判断：如果是 MP4 源文件，字幕会转为 SRT 以兼�
 ## 💡 给 NAS 用户的建议
 
 *   **路径映射**: 为了获得最佳稳定性，建议将 NAS 的共享文件夹映射为本地磁盘（例如映射为 `Z:` 盘），然后再拖入软件处理，避免使用 `\\192.168.x.x` 路径。
-*   **虚拟机直通或 SR-IOV**: 如果您是在宿主机系统下的 Windows 虚拟机中使用，请确保核显已正确直通或 SR-IOV 虚拟并安装了最新的 Intel 驱动。
+*   **虚拟机直通或 SR-IOV**: 如果您是在宿主机系统下的 Windows 虚拟机中使用，请确保显卡已正确直通 (Passthrough) 或 SR-IOV 虚拟，并安装了最新的显卡驱动 (Intel/NVIDIA)。
 *   **原始文件**: 软件默认开启“覆盖源文件”模式，但对于珍贵的原盘资源，建议先开启“另存为”模式测试效果。
 
 ## 🔗 关于作者
@@ -127,7 +171,7 @@ A: 程序会自动判断：如果是 MP4 源文件，字幕会转为 SRT 以兼�
 | 平台 | ID / 频道 | 链接 |
 | :--- | :--- | :--- |
 | Bilibili | **泠萌404** | [点击跳转](https://space.bilibili.com/136850) |
-| YouTube | **泠萌404** | [点击跳转](https://www.youtube.com/@LingMeng404) |
+| YouTube | **泠萌404** | [点击跳转](https://www.youtube.com/@LingMoe404) |
 | Douyin | **泠萌404** | [点击跳转](https://www.douyin.com/user/MS4wLjABAAAA8fYebaVF2xlczanlTvT-bVoRxLqNjp5Tr01pV8wM88Q) |
 
 ## 🙏 致谢

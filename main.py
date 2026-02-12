@@ -1,5 +1,6 @@
 import sys
 import os
+os.environ["QT_API"] = "pyqt6"
 import shutil
 import time
 import re
@@ -19,6 +20,14 @@ from qfluentwidgets import (FluentWindow, SubtitleLabel, StrongBodyLabel, BodyLa
                             LineEdit, PrimaryPushButton, PushButton, ProgressBar, 
                             TextEdit, SwitchButton, ComboBox, CardWidget, InfoBar, 
                             InfoBarPosition, setTheme, Theme, IconWidget, FluentIcon, setThemeColor, isDarkTheme, ImageLabel, MessageDialog)
+
+# [HotFix] 检查后端兼容性：防止 PySide6 混入导致 TypeError
+if not issubclass(FluentWindow, QWidget):
+    print("\n❌ 严重错误: qfluentwidgets 正在使用 PySide6 后端，但本程序基于 PyQt6。")
+    print("👉 请在终端执行以下命令修复环境:")
+    print("   pip uninstall PySide6 PySide6-Fluent-Widgets -y")
+    print("   pip install PyQt6 PyQt6-Fluent-Widgets")
+    sys.exit(1)
 
 # --- 核心工具函数 ---
 def resource_path(relative_path):
@@ -47,12 +56,22 @@ def time_str_to_seconds(time_str):
     except:
         return 0.0
 
+def to_long_path(path):
+    """ 转换路径以支持 Windows 长路径 (超过 260 字符) """
+    if os.name == 'nt':
+        path = os.path.abspath(path)
+        if not path.startswith('\\\\?\\'):
+            return '\\\\?\\' + path
+    return path
+
 DEFAULT_SETTINGS = {
+    "encoder": "Intel QSV",
     "vmaf": "93.0",
     "audio_bitrate": "96k",
     "preset": "4",
     "loudnorm": "loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000",
-    "theme": "Auto"
+    "theme": "Auto",
+    "nv_aq": "True"
 }
 
 def get_config_path():
@@ -104,6 +123,7 @@ class EncoderWorker(QThread):
     def run(self):
         # 解包配置
         src_dir = self.config['src_dir']
+        encoder_type = self.config.get('encoder', 'Intel QSV')
         export_dir = self.config['export_dir']
         cache_dir = self.config['cache_dir']
         overwrite = self.config['overwrite']
@@ -126,10 +146,20 @@ class EncoderWorker(QThread):
         try:
             self.set_system_awake(True)
             tasks = []
-            for dp, dn, filenames in os.walk(src_dir):
-                for f in filenames:
-                    if f.lower().endswith(exts):
-                        tasks.append(os.path.join(dp, f))
+            
+            # [Fix] 兼容单文件路径输入，防止用户直接粘贴文件路径导致无法识别
+            if os.path.isfile(src_dir):
+                if src_dir.lower().endswith(exts):
+                    tasks.append(src_dir)
+            elif os.path.isdir(src_dir):
+                for dp, dn, filenames in os.walk(src_dir):
+                    for f in filenames:
+                        if f.lower().endswith(exts):
+                            tasks.append(os.path.join(dp, f))
+            else:
+                self.log_signal.emit(f"路径不存在或无法访问: {src_dir}", "error")
+                self.finished_signal.emit()
+                return
             
             total_tasks = len(tasks)
             if total_tasks == 0:
@@ -166,13 +196,23 @@ class EncoderWorker(QThread):
                     duration_sec = float(safe_decode(out_dur))
                 except: pass
 
+                # 3. 准备编码器参数
+                if "NVIDIA" in encoder_type:
+                    enc_name = "av1_nvenc"
+                    enc_preset = f"p{preset}" # NVENC uses p1-p7
+                    enc_pix_fmt = "yuv420p10le" # [Fix] ab-av1 参数校验不支持 p010le，需用 yuv420p10le
+                else:
+                    enc_name = "av1_qsv"
+                    enc_preset = preset
+                    enc_pix_fmt = "yuv420p10le" # ab-av1 use
+
                 # 3. ab-av1 搜索
                 cmd_search = [
                     ab_av1, "crf-search", "-i", filepath,
-                    "--encoder", "av1_qsv",
+                    "--encoder", enc_name,
                     "--min-vmaf", str(target_vmaf),
-                    "--preset", preset,
-                    "--pix-format", "yuv420p10le"
+                    "--preset", enc_preset,
+                    "--pix-format", enc_pix_fmt
                 ]
                 if cache_dir and os.path.isdir(cache_dir):
                     cmd_search.extend(["--temp-dir", cache_dir])
@@ -181,6 +221,7 @@ class EncoderWorker(QThread):
                 
                 best_icq = 24
                 search_success = False
+                ab_av1_log = []
                 
                 try:
                     self.current_proc = subprocess.Popen(cmd_search, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0)
@@ -197,9 +238,15 @@ class EncoderWorker(QThread):
                         if not line and self.current_proc.poll() is not None: break
                         if line:
                             decoded = safe_decode(line)
-                            match = re.search(r"crf\s+(\d+)", decoded, re.IGNORECASE)
-                            if match and "VMAF" in decoded:
-                                best_icq = int(match.group(1))
+                            ab_av1_log.append(decoded)
+                            # [Fix] 兼容 NVENC 的 cq/qp 输出，以及 QSV 的 crf 输出，并提取 VMAF 分数
+                            match = re.search(r"(?:crf|cq|qp)\s+(\d+)", decoded, re.IGNORECASE)
+                            vmaf_match = re.search(r"VMAF\s+([\d.]+)", decoded, re.IGNORECASE)
+                            if match and vmaf_match:
+                                val = match.group(1)
+                                vmaf_score = vmaf_match.group(1)
+                                self.log_signal.emit(f"    -> 探测中: {match.group(0).upper()} {val} => VMAF: {vmaf_score}", "info")
+                                best_icq = int(val)
                                 search_success = True
                     self.current_proc.wait()
                     # 显式清理管道
@@ -214,6 +261,10 @@ class EncoderWorker(QThread):
                     self.log_signal.emit(f" -> 术式解析完毕 (ICQ): {best_icq} (๑•̀ㅂ•́)و✧", "success")
                 else:
                     self.log_signal.emit(f" -> 解析失败，强制使用基础术式 ICQ: {best_icq} (T_T)", "error")
+                    # [Fix] 输出 ab-av1 的最后几行日志以便排查
+                    if ab_av1_log:
+                        self.log_signal.emit("    [ab-av1 错误回溯]:", "error")
+                        for l in ab_av1_log[-5:]: self.log_signal.emit(f"    {l}", "error")
 
                 # 4. FFmpeg 转码
                 base_name = os.path.splitext(fname)[0]
@@ -233,29 +284,60 @@ class EncoderWorker(QThread):
                 if fname.lower().endswith(('.mp4', '.mov', '.m4v')):
                     sub_codec = "subrip"
 
-                # [关键] 针对 Ultra 7 265T 优化的参数
-                cmd = [
-                    ffmpeg, "-y", "-hide_banner",
-                    "-init_hw_device", "qsv=hw",
-                    "-i", filepath,
-                    "-c:v", "av1_qsv", "-preset", preset,
-                    "-global_quality:v", str(best_icq), 
-                    "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", # 确保分辨率为偶数，防止 QSV 报错
-                    "-pix_fmt", "p010le",
-                    "-async_depth", "1", # 修复显存溢出/Invalid FrameType
+                # 构建 FFmpeg 命令
+                cmd = []
+                if "NVIDIA" in encoder_type:
+                    # NVIDIA NVENC 参数
+                    cmd = [
+                        ffmpeg, "-y", "-hide_banner",
+                        "-i", filepath,
+                        "-c:v", "av1_nvenc", 
+                        "-preset", enc_preset,
+                        "-rc:v", "vbr",       # [Fix] 显式指定 VBR 模式
+                        "-cq", str(best_icq), # NVENC 使用 -cq 控制质量
+                        "-b:v", "0",          # [Fix] 关键：解除码率上限，防止画质被默认码率限制
+                    ]
+                    if self.config.get('nv_aq', True):
+                        cmd.extend(["-spatial-aq", "1", "-temporal-aq", "1"]) # 感知增强 (AQ)
                     
-                    "-c:a", "libopus", "-b:a", audio_bitrate,
-                    "-ar", "48000", "-ac", "2",
-                    "-af", loudnorm,
-                    "-c:s", sub_codec,
+                    cmd.extend([
+                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                        "-pix_fmt", "p010le",
+                        
+                        "-c:a", "libopus", "-b:a", audio_bitrate,
+                        "-ar", "48000", "-ac", "2",
+                        "-af", loudnorm,
+                        "-c:s", sub_codec,
 
-                    "-map", "0:v:0", 
-                    "-map", "0:a:0?", 
-                    "-map", "0:s?",
-                    "-progress", "pipe:1",
+                        "-map", "0:v:0", 
+                        "-map", "0:a:0?", 
+                        "-map", "0:s?",
+                        "-progress", "pipe:1",
+                        temp_file
+                    ])
+                else:
+                    # Intel QSV 参数 (默认)
+                    cmd = [
+                        ffmpeg, "-y", "-hide_banner",
+                        "-init_hw_device", "qsv=hw",
+                        "-i", filepath,
+                        "-c:v", "av1_qsv", "-preset", preset,
+                        "-global_quality:v", str(best_icq), 
+                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", # 确保分辨率为偶数，防止 QSV 报错
+                        "-pix_fmt", "p010le",
+                        "-async_depth", "1", # 修复显存溢出/Invalid FrameType
+                        
+                        "-c:a", "libopus", "-b:a", audio_bitrate,
+                        "-ar", "48000", "-ac", "2",
+                        "-af", loudnorm,
+                        "-c:s", sub_codec,
 
-                    temp_file
-                ]
+                        "-map", "0:v:0", 
+                        "-map", "0:a:0?", 
+                        "-map", "0:s?",
+                        "-progress", "pipe:1",
+                        temp_file
+                    ]
 
                 try:
                     self.current_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, startupinfo=startupinfo, bufsize=0)
@@ -290,27 +372,46 @@ class EncoderWorker(QThread):
                     if self.current_proc.stderr: self.current_proc.stderr.close()
 
                     if not self.is_running:
-                        if os.path.exists(temp_file): os.remove(temp_file)
+                        lp_temp = to_long_path(temp_file)
+                        if os.path.exists(lp_temp): os.remove(lp_temp)
                         break
 
-                    if self.current_proc.returncode == 0 and os.path.exists(temp_file) and os.path.getsize(temp_file) > 1024:
+                    lp_temp = to_long_path(temp_file)
+                    if self.current_proc.returncode == 0 and os.path.exists(lp_temp) and os.path.getsize(lp_temp) > 1024:
                         try:
+                            lp_dest = to_long_path(final_dest)
+                            abs_src = os.path.normcase(os.path.abspath(filepath))
+                            abs_dest = os.path.normcase(os.path.abspath(final_dest))
+                            lp_src = to_long_path(filepath)
+                            
                             if overwrite:
-                                # 安全覆盖逻辑
-                                if os.path.exists(final_dest): os.remove(final_dest)
-                                shutil.move(temp_file, final_dest)
-                                os.remove(filepath)
+                                # [优化] 安全覆盖逻辑：先尝试移动，成功后再处理原文件
+                                if abs_src == abs_dest:
+                                    # 如果路径完全一致，先重命名原文件作为备份，防止 move 失败
+                                    bak_path = lp_src + ".bak"
+                                    os.replace(lp_src, bak_path)
+                                    shutil.move(lp_temp, lp_dest)
+                                    if os.path.exists(bak_path): os.remove(bak_path)
+                                else:
+                                    if os.path.exists(lp_dest): os.remove(lp_dest)
+                                    shutil.move(lp_temp, lp_dest)
+                                
+                                # 只有当源文件和目标文件不同时(例如 mp4 -> mkv)，才删除源文件
+                                if abs_src != abs_dest:
+                                    os.remove(lp_src)
+                                    
                                 self.log_signal.emit(" -> 净化完成！旧世界已被重写 (Overwrite) (ﾉ>ω<)ﾉ", "success")
                             else:
-                                if os.path.exists(final_dest): os.remove(final_dest)
-                                shutil.move(temp_file, final_dest)
+                                if os.path.exists(lp_dest): os.remove(lp_dest)
+                                shutil.move(lp_temp, lp_dest)
                                 self.log_signal.emit(" -> 净化完成！新世界已确立 (Export) (ﾉ>ω<)ﾉ", "success")
                         except Exception as e:
                             self.log_signal.emit(f" -> 封印仪式失败: {e} (T_T)", "error")
                     else:
                         self.log_signal.emit(" -> 术式失控 (Crash)... (T_T)", "error")
                         for l in err_log: self.log_signal.emit(f"   {l}", "error")
-                        if os.path.exists(temp_file): os.remove(temp_file)
+                        lp_temp = to_long_path(temp_file)
+                        if os.path.exists(lp_temp): os.remove(lp_temp)
                         
                         # 遇到错误时询问用户
                         if self.is_running:
@@ -467,6 +568,10 @@ class MediaInfoInterface(QWidget):
         self.btn_copy.clicked.connect(self.copy_report)
         layout.addWidget(self.btn_copy, 0, Qt.AlignmentFlag.AlignRight)
 
+    def stop_worker(self):
+        if hasattr(self, 'worker') and self.worker.isRunning():
+            self.worker.terminate()
+
     def copy_report(self):
         text = self.info_text.toPlainText()
         if text:
@@ -526,7 +631,7 @@ class ProfileInterface(QWidget):
         desc.setTextColor(QColor("#999999"), QColor("#999999"))
         
         # 版本信息
-        ver = BodyLabel("Version: 1.0.0 | Author: 泠萌404", self.card)
+        ver = BodyLabel("Version: 1.1.0 | Author: 泠萌404", self.card)
         ver.setAlignment(Qt.AlignmentFlag.AlignCenter)
         ver.setTextColor(QColor("#999999"), QColor("#999999"))
         
@@ -620,6 +725,7 @@ class MainWindow(FluentWindow):
         # 初始化 UI
         self.init_ui()
         self.load_settings_to_ui()
+        self.combo_encoder.currentIndexChanged.connect(self.on_encoder_changed)
         
         # 欢迎语
         kaomojis = ["(｡•̀ᴗ-)✧", "(*/ω＼*)", "ヽ(✿ﾟ▽ﾟ)ノ", "(๑•̀ㅂ•́)و✧"]
@@ -630,14 +736,14 @@ class MainWindow(FluentWindow):
 
     def init_ui(self):
         # 主布局
-        self.main_layout = QVBoxLayout(self)
+        self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(20, 20, 20, 20)
         self.main_layout.setSpacing(15)
 
         # 1. 标题栏区域
         header_layout = QVBoxLayout()
         title = SubtitleLabel("炼成祭坛", self)
-        subtitle = BodyLabel("Intel Arc 显卡魔力驱动 · 绝对领域 Edition", self)
+        subtitle = BodyLabel("AV1 硬件加速魔力驱动 · 绝对领域 Edition", self)
         subtitle.setTextColor(QColor("#999999"), QColor("#999999")) # 灰色副标题
         header_layout.addWidget(title)
         header_layout.addWidget(subtitle)
@@ -685,27 +791,26 @@ class MainWindow(FluentWindow):
         row1 = QHBoxLayout()
         
         v1 = QVBoxLayout()
-        v1.addWidget(StrongBodyLabel("视界还原度 (VMAF)", self.card_settings))
-        self.line_vmaf = LineEdit(self.card_settings)
-        v1.addWidget(self.line_vmaf)
-        
-        v2 = QVBoxLayout()
-        v2.addWidget(StrongBodyLabel("共鸣频率 (Bitrate)", self.card_settings))
-        self.line_audio = LineEdit(self.card_settings)
-        v2.addWidget(self.line_audio)
+        v1.addWidget(StrongBodyLabel("魔力核心 (Encoder)", self.card_settings))
+        self.combo_encoder = ComboBox(self.card_settings)
+        self.combo_encoder.addItems(["Intel QSV", "NVIDIA NVENC"])
+        v1.addWidget(self.combo_encoder)
 
+        v2 = QVBoxLayout()
+        v2.addWidget(StrongBodyLabel("视界还原度 (VMAF)", self.card_settings))
+        self.line_vmaf = LineEdit(self.card_settings)
+        v2.addWidget(self.line_vmaf)
+        
         v3 = QVBoxLayout()
-        v3.addWidget(StrongBodyLabel("咏唱速度 (Preset)", self.card_settings))
-        self.combo_preset = ComboBox(self.card_settings)
-        self.combo_preset.addItems(["1", "2", "3", "4", "5", "6", "7"])
-        v3.addWidget(self.combo_preset)
+        v3.addWidget(StrongBodyLabel("共鸣频率 (Bitrate)", self.card_settings))
+        self.line_audio = LineEdit(self.card_settings)
+        v3.addWidget(self.line_audio)
 
         v4 = QVBoxLayout()
-        v4.addWidget(StrongBodyLabel("世界线风格 (Theme)", self.card_settings))
-        self.combo_theme = ComboBox(self.card_settings)
-        self.combo_theme.addItems(["世界线收束 (Auto)", "光之加护 (Light)", "深渊凝视 (Dark)"])
-        self.combo_theme.currentIndexChanged.connect(self.on_theme_changed)
-        v4.addWidget(self.combo_theme)
+        v4.addWidget(StrongBodyLabel("咏唱速度 (Preset)", self.card_settings))
+        self.combo_preset = ComboBox(self.card_settings)
+        self.combo_preset.addItems(["1", "2", "3", "4", "5", "6", "7"])
+        v4.addWidget(self.combo_preset)
 
         row1.addLayout(v1)
         row1.addLayout(v2)
@@ -714,9 +819,32 @@ class MainWindow(FluentWindow):
         set_layout.addLayout(row1)
 
         # 第二行参数
-        set_layout.addWidget(StrongBodyLabel("音量均一化术式 (Loudnorm)", self.card_settings))
+        row2 = QHBoxLayout()
+        
+        v5 = QVBoxLayout()
+        v5.addWidget(StrongBodyLabel("世界线风格 (Theme)", self.card_settings))
+        self.combo_theme = ComboBox(self.card_settings)
+        self.combo_theme.addItems(["世界线收束 (Auto)", "光之加护 (Light)", "深渊凝视 (Dark)"])
+        self.combo_theme.currentIndexChanged.connect(self.on_theme_changed)
+        v5.addWidget(self.combo_theme)
+        
+        v6 = QVBoxLayout()
+        v6.addWidget(StrongBodyLabel("音量均一化术式 (Loudnorm)", self.card_settings))
         self.line_loudnorm = LineEdit(self.card_settings)
-        set_layout.addWidget(self.line_loudnorm)
+        v6.addWidget(self.line_loudnorm)
+        
+        v7 = QVBoxLayout()
+        v7.addWidget(StrongBodyLabel("NVIDIA 感知增强", self.card_settings))
+        self.sw_nv_aq = SwitchButton("开启", self.card_settings)
+        self.sw_nv_aq.setOnText("开启")
+        self.sw_nv_aq.setOffText("关闭")
+        self.sw_nv_aq.setChecked(True)
+        v7.addWidget(self.sw_nv_aq)
+        
+        row2.addLayout(v5)
+        row2.addLayout(v6)
+        row2.addLayout(v7)
+        set_layout.addLayout(row2)
 
         # 保存/恢复按钮
         h_btns = QHBoxLayout()
@@ -841,11 +969,13 @@ class MainWindow(FluentWindow):
                 config.read(cfg_path, encoding='utf-8')
                 if "Settings" in config:
                     sect = config["Settings"]
+                    data["encoder"] = sect.get("encoder", DEFAULT_SETTINGS["encoder"])
                     data["vmaf"] = sect.get("vmaf", DEFAULT_SETTINGS["vmaf"])
                     data["audio_bitrate"] = sect.get("audio_bitrate", DEFAULT_SETTINGS["audio_bitrate"])
                     data["preset"] = sect.get("preset", DEFAULT_SETTINGS["preset"])
                     data["loudnorm"] = sect.get("loudnorm", DEFAULT_SETTINGS["loudnorm"])
                     data["theme"] = sect.get("theme", DEFAULT_SETTINGS["theme"])
+                    data["nv_aq"] = sect.get("nv_aq", DEFAULT_SETTINGS["nv_aq"])
             except: pass
         else:
             self.save_settings_file(DEFAULT_SETTINGS)
@@ -853,6 +983,12 @@ class MainWindow(FluentWindow):
         self.line_vmaf.setText(data["vmaf"])
         self.line_audio.setText(data["audio_bitrate"])
         self.line_loudnorm.setText(data["loudnorm"])
+        self.sw_nv_aq.setChecked(data.get("nv_aq", "True") == "True")
+        
+        # 设置 Encoder
+        enc_idx = 0
+        if "NVIDIA" in data["encoder"]: enc_idx = 1
+        self.combo_encoder.setCurrentIndex(enc_idx)
         
         # 设置 ComboBox
         idx = -1
@@ -868,6 +1004,19 @@ class MainWindow(FluentWindow):
         self.combo_theme.setCurrentIndex(theme_map.get(data["theme"], 0))
         self.on_theme_changed(self.combo_theme.currentIndex()) # 确保应用
 
+    def on_encoder_changed(self, index):
+        is_nv = (index == 1)
+        # 切换默认 VMAF
+        current_vmaf = self.line_vmaf.text()
+        if is_nv:
+            if current_vmaf == "93.0":
+                self.line_vmaf.setText("95.0")
+            self.sw_nv_aq.setEnabled(True)
+        else:
+            if current_vmaf == "95.0":
+                self.line_vmaf.setText("93.0")
+            self.sw_nv_aq.setEnabled(False)
+
     def save_settings_file(self, settings_dict):
         config = configparser.ConfigParser()
         config["Settings"] = settings_dict
@@ -876,19 +1025,23 @@ class MainWindow(FluentWindow):
 
     def save_current_settings(self):
         settings = {
+            "encoder": self.combo_encoder.currentText(),
             "vmaf": self.line_vmaf.text(),
             "audio_bitrate": self.line_audio.text(),
             "preset": self.combo_preset.text(),
             "loudnorm": self.line_loudnorm.text(),
-            "theme": ["Auto", "Light", "Dark"][self.combo_theme.currentIndex()]
+            "theme": ["Auto", "Light", "Dark"][self.combo_theme.currentIndex()],
+            "nv_aq": str(self.sw_nv_aq.isChecked())
         }
         self.save_settings_file(settings)
         InfoBar.success("记忆已铭刻", "当前术式参数已写入 config.ini", parent=self, position=InfoBarPosition.TOP)
 
     def restore_defaults(self):
+        self.combo_encoder.setCurrentIndex(0) # Intel QSV
         self.line_vmaf.setText(DEFAULT_SETTINGS["vmaf"])
         self.line_audio.setText(DEFAULT_SETTINGS["audio_bitrate"])
         self.line_loudnorm.setText(DEFAULT_SETTINGS["loudnorm"])
+        self.sw_nv_aq.setChecked(True)
         
         idx = -1
         for i in range(self.combo_preset.count()):
@@ -976,6 +1129,7 @@ class MainWindow(FluentWindow):
 
         config = {
             'src_dir': src,
+            'encoder': self.combo_encoder.currentText(),
             'export_dir': self.line_export.text(),
             'cache_dir': self.line_cache.text(),
             'overwrite': not self.sw_save_as.isChecked(), # 如果未开启"另存为"，则默认为覆盖
@@ -983,7 +1137,8 @@ class MainWindow(FluentWindow):
             'vmaf': vmaf_val,
             'audio_bitrate': self.line_audio.text(),
             'loudnorm': self.line_loudnorm.text(),
-            'shutdown': self.sw_shutdown.isChecked()
+            'shutdown': self.sw_shutdown.isChecked(),
+            'nv_aq': self.sw_nv_aq.isChecked()
         }
 
         self.worker = EncoderWorker(config)
@@ -998,6 +1153,7 @@ class MainWindow(FluentWindow):
         self.btn_start.setEnabled(False)
         self.btn_start.setText("✨ 奇迹发生中...")
         self.btn_pause.setEnabled(True)
+        self.combo_encoder.setEnabled(False) # 运行中禁止切换后端
         self.btn_pause.setText("⏳ 时空冻结 (Pause)")
         self.btn_stop.setEnabled(True)
         self.pbar_total.setValue(0)
@@ -1053,6 +1209,7 @@ class MainWindow(FluentWindow):
         self.btn_start.setText("✨ 缔结契约 (Start)")
         self.btn_pause.setEnabled(False)
         self.btn_stop.setEnabled(False)
+        self.combo_encoder.setEnabled(True)
         self.worker = None
 
     def check_dependencies(self):
@@ -1098,37 +1255,106 @@ class MainWindow(FluentWindow):
                 
                 # 1. 检查 FFmpeg 软件层面是否包含 av1_qsv 编码器
                 enc_output = subprocess.check_output(
-                    [ffmpeg_path, "-encoders"], 
+                    [ffmpeg_path, "-v", "quiet", "-encoders"], 
                     creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
                 )
+                enc_str = safe_decode(enc_output)
                 
                 # 2. 检查硬件层面是否支持 AV1 编码 (解决旧款 Intel 核显误报问题)
-                # 尝试编码 1 帧空白画面，如果硬件不支持 av1_qsv 会直接报错返回非 0
-                check_cmd = [
-                    ffmpeg_path, "-f", "lavfi", "-i", "color=s=128x128", 
-                    "-c:v", "av1_qsv", "-frames:v", "1", "-f", "null", "-", "-v", "error"
-                ]
-                hw_proc = subprocess.Popen(
-                    check_cmd,
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
-                )
-                _, _ = hw_proc.communicate()
+                has_qsv = False
+                has_nvenc = False
 
-                if b"av1_qsv" not in enc_output:
-                    self.log(">>> 警告：当前术式核心 (FFmpeg) 缺失 av1_qsv 铭文支持。", "error")
-                    InfoBar.warning("术式残缺", "FFmpeg 核心未刻录 av1_qsv 术式，请下载 Full 版本以补全魔导书。", parent=self, position=InfoBarPosition.TOP)
-                elif hw_proc.returncode != 0:
-                    self.log(">>> 警告：未侦测到 Intel QSV AV1 魔力源。非 Arc/Ultra 适格者可能无法驱动此结界。", "error")
-                    InfoBar.warning(
-                        "适格者认证失败", 
-                        "当前魔导器 (显卡) 似乎无法承载 AV1 禁咒 (av1_qsv)。\n请确认您装备了 Intel Arc 或 Core Ultra 系列圣遗物。", 
-                        parent=self, position=InfoBarPosition.TOP, duration=5000
-                    )
+                # 检测 Intel QSV (尝试硬件编码一帧)
+                if "av1_qsv" in enc_str:
+                    try:
+                        proc = subprocess.Popen(
+                            [ffmpeg_path, "-v", "error", "-init_hw_device", "qsv=hw", 
+                             "-f", "lavfi", "-i", "color=black:s=1280x720", 
+                             "-pix_fmt", "p010le",
+                             "-c:v", "av1_qsv", "-frames:v", "1", "-f", "null", "-"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
+                        )
+                        _, stderr = proc.communicate()
+                        if proc.returncode == 0:
+                            has_qsv = True
+                        else:
+                            err_msg = safe_decode(stderr)
+                            if err_msg:
+                                self.log(f">>> Intel QSV 自检未通过: {err_msg.splitlines()[0]}", "warning")
+                    except Exception as e:
+                        self.log(f">>> Intel QSV 检测异常: {e}", "error")
+
+                # 检测 NVIDIA NVENC (尝试硬件编码一帧)
+                if "av1_nvenc" in enc_str:
+                    try:
+                        proc = subprocess.Popen(
+                            [ffmpeg_path, "-v", "error", 
+                             "-f", "lavfi", "-i", "color=black:s=1280x720", 
+                             "-pix_fmt", "p010le",
+                             "-c:v", "av1_nvenc", "-frames:v", "1", "-f", "null", "-"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
+                        )
+                        _, stderr = proc.communicate()
+                        
+                        if proc.returncode == 0:
+                            has_nvenc = True
+                        else:
+                            err_msg = safe_decode(stderr)
+                            
+                            # [优化] 如果是未检测到设备(CUDA_ERROR_NO_DEVICE)，直接静默跳过，不输出冗长日志
+                            if "CUDA_ERROR_NO_DEVICE" in err_msg:
+                                pass
+                            else:
+                                # 尝试 HEVC 验证显卡是否存在 (区分"无显卡"和"显卡不支持AV1")
+                                proc_hevc = subprocess.Popen(
+                                    [ffmpeg_path, "-v", "error", 
+                                     "-f", "lavfi", "-i", "color=black:s=1280x720", 
+                                     "-pix_fmt", "yuv420p",
+                                     "-c:v", "hevc_nvenc", "-frames:v", "1", "-f", "null", "-"],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
+                                )
+                                _, stderr_hevc = proc_hevc.communicate()
+                                if proc_hevc.returncode == 0:
+                                    self.log(">>> 提示: 检测到 NVIDIA 显卡，但该型号不支持 AV1 硬件编码 (需 RTX 40 系列)。", "warning")
+                                else:
+                                    # 简化报错信息，只取第一行
+                                    short_err = err_msg.split('\n')[0] if err_msg else '未知错误'
+                                    self.log(f">>> NVENC 自检未通过: {short_err}", "error")
+                    except Exception as e:
+                        self.log(f">>> NVENC 检测异常: {e}", "error")
+
+                if not has_qsv and not has_nvenc:
+                    self.log(">>> 警告：未侦测到有效的 AV1 硬件编码器 (QSV/NVENC)。", "error")
+                    InfoBar.warning("硬件不支持", "您的显卡似乎不支持 AV1 硬件编码，或者驱动未正确安装。", parent=self, position=InfoBarPosition.TOP)
                 else:
-                    self.log(">>> 适格者认证通过：Intel QSV 动力源同步率 100%！(Ready)", "success")
+                    msg = ">>> 适格者认证通过："
+                    if has_qsv: msg += " [Intel QSV]"
+                    if has_nvenc: msg += " [NVIDIA NVENC]"
+                    self.log(msg + " (Ready)", "success")
+                    
+                    # 自动切换逻辑：如果当前选择的编码器不可用，自动切换到可用的那个
+                    current_enc = self.combo_encoder.currentText()
+                    if "Intel" in current_enc and not has_qsv and has_nvenc:
+                        self.combo_encoder.setCurrentIndex(1) # Switch to NVENC
+                        self.log(">>> 已自动切换至 NVIDIA NVENC 术式。", "info")
+                    elif "NVIDIA" in current_enc and not has_nvenc and has_qsv:
+                        self.combo_encoder.setCurrentIndex(0) # Switch to QSV
+                        self.log(">>> 已自动切换至 Intel QSV 术式。", "info")
+                    
             except Exception as e:
                 self.log(f">>> 环境自检异常: {e}", "error")
+
+    def closeEvent(self, event):
+        """ [Fix] 窗口关闭时强制终止所有子进程 """
+        if self.worker and self.worker.isRunning():
+            self.worker.stop()
+            self.worker.wait(500)
+        # 清理真理之眼的分析线程
+        self.info_interface.stop_worker()
+        super().closeEvent(event)
 
 if __name__ == '__main__':
     # 设置 AppUserModelID，将程序与 Python 解释器区分开，确保任务栏图标清晰且独立
