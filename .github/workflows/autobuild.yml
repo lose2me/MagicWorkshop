@@ -1,4 +1,4 @@
-name: Build (Nuitka + zstd)
+name: AutoBuild
 
 on:
   workflow_dispatch:
@@ -44,9 +44,11 @@ jobs:
           }
           7z i | Select-Object -First 5
 
-      - name: Package release archive (high compression)
+      - name: Package release archive
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $exe = "build/nuitka/魔法少女工坊.exe"
           $tools = "tools"
           $stage = "build/package/MagicWorkshop"
@@ -56,11 +58,22 @@ jobs:
           if (!(Test-Path $tools)) { throw "Tools folder not found: $tools" }
 
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item $exe -Destination (Join-Path $stage "魔法少女工坊.exe") -Force
-          Copy-Item $tools -Destination (Join-Path $stage "tools") -Recurse -Force
+          Get-ChildItem -Path $stage -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+          Copy-Item -LiteralPath $exe -Destination (Join-Path $stage "魔法少女工坊.exe") -Force
+          Copy-Item -LiteralPath $tools -Destination (Join-Path $stage "tools") -Recurse -Force
+
+          $stagedExe = Join-Path $stage "魔法少女工坊.exe"
+          $stagedTools = Join-Path $stage "tools"
+          if (!(Test-Path $stagedExe)) { throw "Staged exe not found: $stagedExe" }
+          if (!(Test-Path $stagedTools)) { throw "Staged tools folder not found: $stagedTools" }
 
           if (Test-Path $archive) { Remove-Item $archive -Force }
-          7z a -t7z $archive "$stage\\*" -m0=lzma2 -mx=9 -mfb=273 -md=128m -ms=on -mmt=on
+          Push-Location $stage
+          7z a -t7z "..\\MagicWorkshop.7z" ".\\*" -m0=lzma2 -mx=9 -mfb=273 -md=128m -ms=on -mmt=on
+          $exitCode = $LASTEXITCODE
+          Pop-Location
+          if ($exitCode -ne 0) { throw "7z failed with exit code $exitCode" }
 
       - name: Show artifact info
         shell: pwsh
