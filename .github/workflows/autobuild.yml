@@ -25,7 +25,7 @@ jobs:
       - name: Sync project dependencies
         run: uv sync --locked --no-dev
 
-      - name: Build onefile executable with Nuitka + zstandard
+      - name: Build onefile executable
         run: >
           uv run --locked --with nuitka --with zstandard python -m nuitka main.py
           --onefile
