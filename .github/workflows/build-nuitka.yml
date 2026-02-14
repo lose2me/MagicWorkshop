@@ -1,0 +1,55 @@
+name: Build (Nuitka + zstd)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup uv and Python 3.12
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Sync project dependencies
+        run: uv sync --locked --no-dev
+
+      - name: Build onefile executable with Nuitka + zstandard
+        run: >
+          uv run --locked --with nuitka --with zstandard python -m nuitka main.py
+          --onefile
+          --windows-console-mode=disable
+          --enable-plugin=pyqt6
+          --assume-yes-for-downloads
+          --windows-icon-from-ico=logo.ico
+          --output-dir=build/nuitka
+          --output-filename=MagicWorkshop-Nuitka.exe
+
+      - name: Show artifact info
+        shell: pwsh
+        run: |
+          $exe = "build/nuitka/MagicWorkshop-Nuitka.exe"
+          if (!(Test-Path $exe)) { throw "Build output not found: $exe" }
+          $sizeMB = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          Write-Host "Built: $exe"
+          Write-Host "Size: ${sizeMB} MB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MagicWorkshop-Nuitka-Windows
+          path: build/nuitka/MagicWorkshop-Nuitka.exe
+          if-no-files-found: error

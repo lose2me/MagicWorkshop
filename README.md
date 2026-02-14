@@ -137,9 +137,9 @@
     cd MagicWorkshop
     ```
 
-2.  **安装依赖**
+2.  **安装依赖 (uv)**
     ```bash
-    pip install PyQt6 PyQt6-Fluent-Widgets
+    uv sync
     ```
 
 3.  **准备核心组件**
@@ -149,7 +149,7 @@
 
 4.  **运行**
     ```bash
-    python main.py
+    uv run main.py
     ```
 
 ## 🛠️ 常见问题
