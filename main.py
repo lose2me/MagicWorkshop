@@ -12,14 +12,128 @@ import configparser
 
 from PySide6.QtCore import Qt, QThread, Signal as pyqtSignal, QObject, QSize, QUrl, QPropertyAnimation, Property as pyqtProperty, QTimer
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-                               QFileDialog, QFrame, QSpacerItem, QSizePolicy)
-from PySide6.QtGui import QIcon, QColor, QDesktopServices, QPainter, QPainterPath, QPixmap
+                               QFileDialog, QFrame, QSpacerItem, QSizePolicy, QListWidgetItem, QAbstractItemView, QSplitter, QStyleOptionViewItem, QStyle)
+from PySide6.QtGui import QIcon, QColor, QDesktopServices, QPainter, QPainterPath, QPixmap, QGuiApplication
 
 # 引入 Fluent Widgets (Win11 风格组件)
 from qfluentwidgets import (FluentWindow, SubtitleLabel, StrongBodyLabel, BodyLabel, 
                             LineEdit, PrimaryPushButton, PushButton, ProgressBar, 
                             TextEdit, SwitchButton, ComboBox, CardWidget, InfoBar, 
-                            InfoBarPosition, setTheme, Theme, IconWidget, FluentIcon, setThemeColor, isDarkTheme, ImageLabel, MessageDialog)
+                            InfoBarPosition, setTheme, Theme, IconWidget, FluentIcon, setThemeColor, isDarkTheme, ImageLabel, MessageDialog,
+                            ListWidget)
+from qfluentwidgets.components.widgets.list_view import ListItemDelegate
+
+
+class ClickableBodyLabel(BodyLabel):
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(e)
+
+
+class NoHighlightItemDelegate(ListItemDelegate):
+    """兼容 Fluent ListWidget 接口，同时去除 hover/selected/focus 高亮。"""
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        opt.state &= ~QStyle.StateFlag.State_Selected
+        opt.state &= ~QStyle.StateFlag.State_MouseOver
+        opt.state &= ~QStyle.StateFlag.State_HasFocus
+
+        selected_rows = self.selectedRows.copy()
+        hover_row = self.hoverRow
+        pressed_row = self.pressedRow
+
+        self.selectedRows = set()
+        self.hoverRow = -1
+        self.pressedRow = -1
+        try:
+            super().paint(painter, opt, index)
+        finally:
+            self.selectedRows = selected_rows
+            self.hoverRow = hover_row
+            self.pressedRow = pressed_row
+
+
+class DroppableBodyLabel(BodyLabel):
+    filesDropped = pyqtSignal(list)
+    dragActiveChanged = pyqtSignal(bool)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            self.dragActiveChanged.emit(True)
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dragLeaveEvent(self, e):
+        self.dragActiveChanged.emit(False)
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.filesDropped.emit(paths)
+            self.dragActiveChanged.emit(False)
+            e.acceptProposedAction()
+        else:
+            self.dragActiveChanged.emit(False)
+            e.ignore()
+
+
+class DroppableListWidget(ListWidget):
+    filesDropped = pyqtSignal(list)
+    dragActiveChanged = pyqtSignal(bool)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptDrops(True)
+        # 使用无高亮委托，避免主题切换后 Fluent 默认高亮复活
+        self.setItemDelegate(NoHighlightItemDelegate(self))
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            self.dragActiveChanged.emit(True)
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dragLeaveEvent(self, e):
+        self.dragActiveChanged.emit(False)
+        super().dragLeaveEvent(e)
+
+    def dropEvent(self, e):
+        paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.filesDropped.emit(paths)
+            self.dragActiveChanged.emit(False)
+            e.acceptProposedAction()
+        else:
+            self.dragActiveChanged.emit(False)
+            e.ignore()
+
+    def mousePressEvent(self, e):
+        super().mousePressEvent(e)
+        self.clearSelection()
+        self.setCurrentRow(-1)
 
 # --- 核心工具函数 ---
 def resource_path(relative_path):
@@ -70,6 +184,13 @@ DEFAULT_SETTINGS = {
     "nv_aq": "True"
 }
 
+VIDEO_EXTS = ('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts')
+
+def get_default_cache_dir():
+    """ 获取默认缓存目录 (软件根目录/cache) """
+    base_path = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.abspath(".")
+    return os.path.join(base_path, "cache")
+
 def get_config_path():
     """ 获取配置文件路径 (exe同级) """
     base_path = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.abspath(".")
@@ -118,10 +239,14 @@ class EncoderWorker(QThread):
 
     def run(self):
         # 解包配置
-        src_dir = self.config['src_dir']
+        selected_files = self.config.get('selected_files') or []
         encoder_type = self.config.get('encoder', 'Intel QSV')
         export_dir = self.config['export_dir']
-        cache_dir = self.config['cache_dir']
+        cache_dir = self.config.get('cache_dir') or get_default_cache_dir()
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+        except:
+            cache_dir = ""
         overwrite = self.config['overwrite']
         preset = self.config['preset']
         target_vmaf = self.config['vmaf']
@@ -136,26 +261,15 @@ class EncoderWorker(QThread):
         os.environ["PATH"] += os.pathsep + os.path.dirname(ffmpeg)
         startupinfo = subprocess.STARTUPINFO()
         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        
-        exts = ('.mkv', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v', '.ts')
 
         try:
             self.set_system_awake(True)
             tasks = []
-            
-            # [Fix] 兼容单文件路径输入，防止用户直接粘贴文件路径导致无法识别
-            if os.path.isfile(src_dir):
-                if src_dir.lower().endswith(exts):
-                    tasks.append(src_dir)
-            elif os.path.isdir(src_dir):
-                for dp, dn, filenames in os.walk(src_dir):
-                    for f in filenames:
-                        if f.lower().endswith(exts):
-                            tasks.append(os.path.join(dp, f))
-            else:
-                self.log_signal.emit(f"路径不存在或无法访问: {src_dir}", "error")
-                self.finished_signal.emit()
-                return
+
+            # 统一使用已选择素材列表
+            for p in selected_files:
+                if os.path.isfile(p) and p.lower().endswith(VIDEO_EXTS):
+                    tasks.append(p)
             
             total_tasks = len(tasks)
             if total_tasks == 0:
@@ -193,10 +307,26 @@ class EncoderWorker(QThread):
                 except: pass
 
                 # 3. 准备编码器参数
+                def map_amd_preset(p):
+                    # 将 1-7 的通用速度预设映射为 AMF 支持的预设
+                    try:
+                        p = int(p)
+                    except:
+                        p = 4
+                    if p <= 2:
+                        return "quality"
+                    if p <= 5:
+                        return "balanced"
+                    return "speed"
+
                 if "NVIDIA" in encoder_type:
                     enc_name = "av1_nvenc"
                     enc_preset = f"p{preset}" # NVENC uses p1-p7
                     enc_pix_fmt = "yuv420p10le" # [Fix] ab-av1 参数校验不支持 p010le，需用 yuv420p10le
+                elif "AMD" in encoder_type:
+                    enc_name = "av1_amf"
+                    enc_preset = map_amd_preset(preset)
+                    enc_pix_fmt = "yuv420p10le"
                 else:
                     enc_name = "av1_qsv"
                     enc_preset = preset
@@ -311,6 +441,32 @@ class EncoderWorker(QThread):
                         "-progress", "pipe:1",
                         temp_file
                     ])
+                elif "AMD" in encoder_type:
+                    # AMD AMF 参数
+                    cmd = [
+                        ffmpeg, "-y", "-hide_banner",
+                        "-i", filepath,
+                        "-c:v", "av1_amf",
+                        "-usage", "transcoding",
+                        "-quality", enc_preset,
+                        "-rc", "cqp",
+                        "-qp_i", str(best_icq),
+                        "-qp_p", str(best_icq),
+                        "-qp_b", str(best_icq),
+                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                        "-pix_fmt", "p010le",
+
+                        "-c:a", "libopus", "-b:a", audio_bitrate,
+                        "-ar", "48000", "-ac", "2",
+                        "-af", loudnorm,
+                        "-c:s", sub_codec,
+
+                        "-map", "0:v:0",
+                        "-map", "0:a:0?",
+                        "-map", "0:s?",
+                        "-progress", "pipe:1",
+                        temp_file
+                    ]
                 else:
                     # Intel QSV 参数 (默认)
                     cmd = [
@@ -701,7 +857,9 @@ class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("魔法少女工坊 ")
-        self.resize(800, 750)
+        self.resize(1180, 780)
+        self._base_min_size = QSize(1180, 780)
+        self._centered_once = False
         
         # 启用 Mica 效果 (Win11 特有半透明背景)
         self.windowEffect.setMicaEffect(self.winId())
@@ -717,9 +875,12 @@ class MainWindow(FluentWindow):
 
         # 核心变量
         self.worker = None
+        self.selected_files = []
+        self._drag_over_source_zone = False
         
         # 初始化 UI
         self.init_ui()
+        self.apply_min_window_size()
         self.load_settings_to_ui()
         self.combo_encoder.currentIndexChanged.connect(self.on_encoder_changed)
         
@@ -729,6 +890,15 @@ class MainWindow(FluentWindow):
         
         # 启动 0.5 秒后检查结界完整性 (依赖检查)
         QTimer.singleShot(500, self.check_dependencies)
+
+    def apply_min_window_size(self):
+        """根据当前布局自动计算最小可用尺寸，避免控件挤压错位。"""
+        hint = self.minimumSizeHint()
+        min_w = max(self._base_min_size.width(), hint.width())
+        min_h = max(self._base_min_size.height(), hint.height())
+        self.setMinimumSize(min_w, min_h)
+        if self.width() < min_w or self.height() < min_h:
+            self.resize(max(self.width(), min_w), max(self.height(), min_h))
 
     def init_ui(self):
         # 主布局
@@ -762,25 +932,32 @@ class MainWindow(FluentWindow):
 
         self.main_layout.addLayout(header_row)
 
-        # 2. 卡片区域 (使用 CardWidget)
-        # --- 输入输出卡片 ---
+        # 2. 分栏区域
+        content_row = QHBoxLayout()
+        content_row.setSpacing(14)
+        self.column_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.column_splitter.setChildrenCollapsible(False)
+        self.column_splitter.setHandleWidth(8)
+        self.column_splitter.setStyleSheet("QSplitter::handle { background: transparent; }")
+
+        self.left_panel = QWidget(self)
+        self.left_panel.setMinimumWidth(0)
+        left_column = QVBoxLayout(self.left_panel)
+        left_column.setContentsMargins(0, 0, 0, 0)
+        left_column.setSpacing(12)
+
+        self.right_panel = QWidget(self)
+        self.right_panel.setMinimumWidth(0)
+        right_column = QVBoxLayout(self.right_panel)
+        right_column.setContentsMargins(0, 0, 0, 0)
+        right_column.setSpacing(12)
+
+        # 2.1 左栏卡片区域 (使用 CardWidget)
+        # --- 缓存卡片 ---
         self.card_io = CardWidget(self)
         io_layout = QVBoxLayout(self.card_io)
         io_layout.setContentsMargins(18, 16, 18, 16)
         io_layout.setSpacing(12)
-        
-        # 视频源
-        io_layout.addWidget(StrongBodyLabel("素材次元 (Source)", self.card_io))
-        h1 = QHBoxLayout()
-        self.line_src = LineEdit(self.card_io)
-        self.line_src.setPlaceholderText("选择包含视频的文件夹...")
-        self.line_src.setMinimumHeight(36)
-        self.btn_src = PushButton("浏览", self.card_io)
-        self.btn_src.setMinimumHeight(36)
-        self.btn_src.clicked.connect(lambda: self.browse_folder(self.line_src))
-        h1.addWidget(self.line_src)
-        h1.addWidget(self.btn_src)
-        io_layout.addLayout(h1)
 
         # 缓存
         io_layout.addWidget(StrongBodyLabel("魔力回路缓冲 (Cache)", self.card_io))
@@ -788,6 +965,7 @@ class MainWindow(FluentWindow):
         self.line_cache = LineEdit(self.card_io)
         self.line_cache.setPlaceholderText("ab-av1 临时文件存放处...")
         self.line_cache.setMinimumHeight(36)
+        self.line_cache.setText(get_default_cache_dir())
         self.btn_cache = PushButton("浏览", self.card_io)
         self.btn_cache.setMinimumHeight(36)
         self.btn_cache.clicked.connect(lambda: self.browse_folder(self.line_cache))
@@ -800,8 +978,7 @@ class MainWindow(FluentWindow):
         h2.addWidget(self.btn_clear_cache)
         
         io_layout.addLayout(h2)
-        
-        self.main_layout.addWidget(self.card_io)
+        left_column.addWidget(self.card_io)
 
         # --- 参数设置卡片 ---
         self.card_settings = CardWidget(self)
@@ -816,7 +993,7 @@ class MainWindow(FluentWindow):
         v1 = QVBoxLayout()
         v1.addWidget(StrongBodyLabel("魔力核心 (Encoder)", self.card_settings))
         self.combo_encoder = ComboBox(self.card_settings)
-        self.combo_encoder.addItems(["Intel QSV", "NVIDIA NVENC"])
+        self.combo_encoder.addItems(["Intel QSV", "NVIDIA NVENC", "AMD AMF"])
         self.combo_encoder.setMinimumHeight(36)
         v1.addWidget(self.combo_encoder)
 
@@ -863,9 +1040,8 @@ class MainWindow(FluentWindow):
         self.sw_nv_aq.setChecked(True)
         v7.addWidget(self.sw_nv_aq)
         
-        row2.addLayout(v6, 2)
+        row2.addLayout(v6, 4)
         row2.addLayout(v7, 1)
-        row2.addStretch(1)
         set_layout.addLayout(row2)
 
         # 保存/恢复按钮
@@ -883,7 +1059,7 @@ class MainWindow(FluentWindow):
         h_btns.addStretch(1)
         set_layout.addLayout(h_btns)
 
-        self.main_layout.addWidget(self.card_settings)
+        left_column.addWidget(self.card_settings)
 
         # --- 选项与操作卡片 ---
         self.card_action = CardWidget(self)
@@ -894,10 +1070,14 @@ class MainWindow(FluentWindow):
         # 开关组
         sw_layout = QHBoxLayout()
         self.sw_save_as = SwitchButton("开辟新世界 (Save As)", self.card_action)
+        self.sw_save_as.setOnText("开辟新世界 (Save As)")
+        self.sw_save_as.setOffText("开辟新世界 (Save As)")
         self.sw_save_as.setChecked(False)
         self.sw_save_as.checkedChanged.connect(self.toggle_export_ui)
         
         self.sw_shutdown = SwitchButton("仪式后强制休眠 (Shutdown)", self.card_action)
+        self.sw_shutdown.setOnText("仪式后强制休眠 (Shutdown)")
+        self.sw_shutdown.setOffText("仪式后强制休眠 (Shutdown)")
         
         sw_layout.addWidget(self.sw_save_as)
         sw_layout.addSpacing(20)
@@ -944,7 +1124,82 @@ class MainWindow(FluentWindow):
         btn_layout.addWidget(self.btn_stop)
         act_layout.addLayout(btn_layout)
 
-        self.main_layout.addWidget(self.card_action)
+        left_column.addWidget(self.card_action)
+
+        # 2.2 右栏：素材次元（选择入口）
+        self.card_source = CardWidget(self)
+        source_layout = QVBoxLayout(self.card_source)
+        source_layout.setContentsMargins(18, 16, 18, 16)
+        source_layout.setSpacing(10)
+        source_layout.addWidget(StrongBodyLabel("素材次元 (Source)", self.card_source))
+
+        source_btns = QHBoxLayout()
+        source_btns.setSpacing(10)
+        self.btn_src = PushButton("以文件夹之名", self.card_source)
+        self.btn_src.setMinimumHeight(36)
+        self.btn_src.clicked.connect(self.choose_source_folder)
+        self.btn_files = PushButton("以文件之名", self.card_source)
+        self.btn_files.setMinimumHeight(36)
+        self.btn_files.clicked.connect(self.browse_files)
+        source_btns.addWidget(self.btn_src)
+        source_btns.addWidget(self.btn_files)
+        source_layout.addLayout(source_btns)
+
+        right_column.addWidget(self.card_source)
+        self.sync_source_cache_card_height()
+
+        # 2.3 右栏：已选素材列表
+        self.card_selected_files = CardWidget(self)
+        selected_layout = QVBoxLayout(self.card_selected_files)
+        selected_layout.setContentsMargins(18, 16, 18, 16)
+        selected_layout.setSpacing(8)
+
+        selected_header = QHBoxLayout()
+        selected_header.addWidget(StrongBodyLabel("次元空间 (List)", self.card_selected_files))
+        selected_header.addStretch(1)
+        self.lbl_selected_count_right = BodyLabel("0", self.card_selected_files)
+        selected_header.addWidget(self.lbl_selected_count_right)
+        selected_layout.addLayout(selected_header)
+
+        self.lbl_selected_placeholder = DroppableBodyLabel("把元素拖拽到此处", self.card_selected_files)
+        self.lbl_selected_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_selected_placeholder.setTextColor(QColor("#FB7299"), QColor("#FB7299"))
+        self.lbl_selected_placeholder.setMinimumHeight(330)
+        self.lbl_selected_placeholder.filesDropped.connect(self.handle_dropped_paths)
+        self.lbl_selected_placeholder.dragActiveChanged.connect(self.on_selected_zone_drag_active_changed)
+        selected_layout.addWidget(self.lbl_selected_placeholder)
+
+        self.list_selected_files = DroppableListWidget(self.card_selected_files)
+        self.list_selected_files.setMinimumHeight(330)
+        self.list_selected_files.setSpacing(0)
+        self.list_selected_files.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.list_selected_files.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.list_selected_files.setUniformItemSizes(True)
+        self.list_selected_files.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.list_selected_files.setContentsMargins(0, 0, 0, 0)
+        self.list_selected_files.setViewportMargins(0, 0, 0, 0)
+        if hasattr(self.list_selected_files, "setSelectionRectVisible"):
+            self.list_selected_files.setSelectionRectVisible(False)
+        if hasattr(self.list_selected_files, "setSelectRightClickedRow"):
+            self.list_selected_files.setSelectRightClickedRow(False)
+        self.list_selected_files.pressed.connect(lambda _: self.clear_selected_list_visual_state())
+        self.list_selected_files.clicked.connect(lambda _: self.clear_selected_list_visual_state())
+        self.list_selected_files.filesDropped.connect(self.handle_dropped_paths)
+        self.list_selected_files.dragActiveChanged.connect(self.on_selected_zone_drag_active_changed)
+        selected_layout.addWidget(self.list_selected_files)
+        self.update_selected_count()
+
+        right_column.addWidget(self.card_selected_files)
+        right_column.addStretch(1)
+
+        self.column_splitter.addWidget(self.left_panel)
+        self.column_splitter.addWidget(self.right_panel)
+        self.column_splitter.setStretchFactor(0, 1)
+        self.column_splitter.setStretchFactor(1, 1)
+        self.column_splitter.setSizes([1, 1])
+
+        content_row.addWidget(self.column_splitter, 1)
+        self.main_layout.addLayout(content_row)
 
         # 3. 底部状态区
 
@@ -987,6 +1242,41 @@ class MainWindow(FluentWindow):
         self.profile_interface = ProfileInterface(self)
         self.addSubInterface(self.profile_interface, FluentIcon.PEOPLE, "观测者档案")
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._centered_once:
+            self._centered_once = True
+            QTimer.singleShot(0, self.center_on_screen)
+        QTimer.singleShot(0, self.equalize_columns)
+        QTimer.singleShot(0, self.sync_source_cache_card_height)
+        QTimer.singleShot(0, self.update_selected_zone_border)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.equalize_columns()
+        self.sync_source_cache_card_height()
+
+    def equalize_columns(self):
+        if hasattr(self, "column_splitter") and self.column_splitter:
+            total = max(self.column_splitter.width(), 2)
+            half = total // 2
+            self.column_splitter.setSizes([half, total - half])
+
+    def sync_source_cache_card_height(self):
+        if hasattr(self, "card_io") and hasattr(self, "card_source"):
+            target = max(self.card_io.minimumSizeHint().height(), self.card_source.minimumSizeHint().height())
+            self.card_io.setFixedHeight(target)
+            self.card_source.setFixedHeight(target)
+
+    def center_on_screen(self):
+        screen = self.windowHandle().screen() if self.windowHandle() else QGuiApplication.primaryScreen()
+        if not screen:
+            return
+        screen_geo = screen.availableGeometry()
+        frame_geo = self.frameGeometry()
+        frame_geo.moveCenter(screen_geo.center())
+        self.move(frame_geo.topLeft())
+
     def load_settings_to_ui(self):
         cfg_path = get_config_path()
         config = configparser.ConfigParser()
@@ -1016,6 +1306,7 @@ class MainWindow(FluentWindow):
         # 设置 Encoder
         enc_idx = 0
         if "NVIDIA" in data["encoder"]: enc_idx = 1
+        elif "AMD" in data["encoder"]: enc_idx = 2
         self.combo_encoder.setCurrentIndex(enc_idx)
         
         # 设置 ComboBox
@@ -1091,11 +1382,194 @@ class MainWindow(FluentWindow):
         elif index == 2:
             setTheme(Theme.DARK)
         setThemeColor('#FB7299') # 重新应用主题色
+        # 主题切换会刷新控件样式，延迟重绘一次拖拽提示边框，防止虚线被覆盖
+        QTimer.singleShot(0, self.update_selected_zone_border)
+        QTimer.singleShot(120, self.update_selected_zone_border)
 
     def browse_folder(self, line_edit):
         folder = QFileDialog.getExistingDirectory(self, "选择文件夹")
         if folder:
             line_edit.setText(folder)
+
+    def add_source_paths(self, paths):
+        existing = set(self.selected_files)
+        added = 0
+
+        for raw in paths:
+            if not raw:
+                continue
+            p = os.path.normpath(raw)
+
+            if os.path.isdir(p):
+                for dp, dn, filenames in os.walk(p):
+                    for f in filenames:
+                        fp = os.path.join(dp, f)
+                        if fp.lower().endswith(VIDEO_EXTS) and fp not in existing:
+                            self.selected_files.append(fp)
+                            existing.add(fp)
+                            added += 1
+            elif os.path.isfile(p):
+                if p.lower().endswith(VIDEO_EXTS) and p not in existing:
+                    self.selected_files.append(p)
+                    existing.add(p)
+                    added += 1
+
+        if added > 0:
+            self.update_selected_count()
+        return added
+
+    def handle_dropped_paths(self, paths):
+        added = self.add_source_paths(paths)
+        if added == 0:
+            InfoBar.warning("未添加素材", "拖拽内容中没有可处理的视频文件，或已全部存在。", parent=self, position=InfoBarPosition.TOP)
+        else:
+            InfoBar.success("素材已加入", f"拖拽添加 {added} 个文件。", parent=self, position=InfoBarPosition.TOP)
+
+    def clear_selected_list_visual_state(self):
+        if hasattr(self, "list_selected_files"):
+            self.list_selected_files.clearSelection()
+            self.list_selected_files.setCurrentRow(-1)
+
+    def on_selected_zone_drag_active_changed(self, active):
+        self._drag_over_source_zone = bool(active)
+        self.update_selected_zone_border()
+
+    def update_selected_zone_border(self):
+        if not hasattr(self, "lbl_selected_placeholder") or not hasattr(self, "list_selected_files"):
+            return
+
+        show_hint_border = self._drag_over_source_zone or (len(self.selected_files) == 0)
+        border_css = "2px dashed rgba(251, 114, 153, 0.90)" if show_hint_border else "1px solid transparent"
+        bg_css = "rgba(251, 114, 153, 0.06)" if show_hint_border else "transparent"
+
+        self.lbl_selected_placeholder.setStyleSheet(
+            f"border: {border_css}; border-radius: 10px; background: {bg_css}; padding: 8px; color: #FB7299; font-size: 18px; font-weight: 700;"
+        )
+
+        self.list_selected_files.setStyleSheet(f"""
+            ListWidget {{
+                background: {bg_css};
+                border: {border_css};
+                border-radius: 10px;
+                outline: none;
+            }}
+            ListWidget::item {{
+                background: transparent;
+                border: none;
+                margin: 0px;
+                padding: 0px;
+            }}
+            ListWidget::item:hover {{
+                background: transparent;
+            }}
+            ListWidget::item:selected {{
+                background: transparent;
+            }}
+            QListWidget {{
+                background: {bg_css};
+                border: {border_css};
+                border-radius: 10px;
+                outline: none;
+            }}
+            QListWidget::item {{
+                background: transparent;
+                border: none;
+                margin: 0px;
+                padding: 0px;
+            }}
+            QListWidget::item:hover {{
+                background: transparent;
+            }}
+            QListWidget::item:selected {{
+                background: transparent;
+            }}
+        """)
+
+    def choose_source_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "选择素材文件夹")
+        if not folder:
+            return
+        added = self.add_source_paths([folder])
+        if added == 0:
+            InfoBar.warning("未发现可用文件", "该文件夹下没有可处理的视频文件。", parent=self, position=InfoBarPosition.TOP)
+        else:
+            InfoBar.success("素材已加入", f"已添加 {added} 个文件。", parent=self, position=InfoBarPosition.TOP)
+
+    def browse_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择视频文件",
+            "",
+            "Video Files (*.mkv *.mp4 *.avi *.mov *.wmv *.flv *.webm *.m4v *.ts);;All Files (*.*)"
+        )
+        if files:
+            self.add_source_paths(files)
+
+    def remove_selected_file(self, file_path):
+        self.selected_files = [p for p in self.selected_files if p != file_path]
+        self.update_selected_count()
+
+    def update_selected_count(self):
+        count = len(self.selected_files)
+        if hasattr(self, 'lbl_selected_count_right'):
+            self.lbl_selected_count_right.setText(str(count))
+
+        if hasattr(self, 'lbl_selected_placeholder') and hasattr(self, 'list_selected_files'):
+            is_empty = (count == 0)
+            self.lbl_selected_placeholder.setVisible(is_empty)
+            self.list_selected_files.setVisible(not is_empty)
+            self.list_selected_files.clear()
+            self.update_selected_zone_border()
+
+            for idx, p in enumerate(self.selected_files):
+                item = QListWidgetItem(self.list_selected_files)
+                item.setSizeHint(QSize(0, 40))
+
+                item_widget = QWidget(self.list_selected_files)
+                container = QVBoxLayout(item_widget)
+                container.setContentsMargins(0, 0, 0, 0)
+                container.setSpacing(0)
+
+                row = QWidget(item_widget)
+                row.setFixedHeight(39)
+                row_layout = QHBoxLayout(row)
+                row_layout.setContentsMargins(10, 4, 12, 4)
+                row_layout.setSpacing(8)
+
+                name_label = BodyLabel(os.path.basename(p) or p, row)
+                name_label.setToolTip(p)
+
+                btn_remove = ClickableBodyLabel("移除", row)
+                btn_remove.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_remove.setStyleSheet("font-weight: 700; background: transparent;")
+                btn_remove.setTextColor(QColor("#D93652"), QColor("#FF8FA1"))
+                btn_remove.clicked.connect(lambda path=p: self.remove_selected_file(path))
+
+                row_layout.addWidget(name_label)
+                row_layout.addStretch(1)
+                row_layout.addWidget(btn_remove)
+
+                divider_wrap = QWidget(item_widget)
+                divider_wrap.setFixedHeight(1)
+                divider_layout = QHBoxLayout(divider_wrap)
+                divider_layout.setContentsMargins(10, 0, 10, 0)
+                divider_layout.setSpacing(0)
+                divider = QFrame(divider_wrap)
+                divider.setFixedHeight(1)
+                divider.setFrameShape(QFrame.Shape.HLine)
+                divider.setFrameShadow(QFrame.Shadow.Plain)
+                if idx == count - 1:
+                    divider.setStyleSheet("background-color: transparent; border: none;")
+                else:
+                    divider.setStyleSheet("background-color: rgba(127, 127, 127, 0.30); border: none;")
+                divider_layout.addWidget(divider)
+
+                container.addWidget(row)
+                container.addWidget(divider_wrap)
+
+                self.list_selected_files.setItemWidget(item, item_widget)
+
+            self.clear_selected_list_visual_state()
 
     def toggle_export_ui(self):
         is_save_as = self.sw_save_as.isChecked()
@@ -1115,6 +1589,7 @@ class MainWindow(FluentWindow):
         ts_color = "#AAAAAA" if is_dark else "#888888"
         color = "#FFFFFF" if is_dark else "#000000"
         if level == "error": color = "#FF4E6A" if is_dark else "#C00000"
+        elif level == "warning": color = "#FFC857" if is_dark else "#B36B00"
         elif level == "success": color = "#55E555" if is_dark else "#008800"
         elif level == "info": color = ts_color if is_dark else "#444444"
         
@@ -1126,10 +1601,9 @@ class MainWindow(FluentWindow):
         self.text_log.setTextCursor(cursor)
 
     def clear_cache_files(self):
-        cache_path = self.line_cache.text()
-        if not cache_path or not os.path.exists(cache_path):
-             InfoBar.warning("目标丢失", "请先指定有效的魔力缓冲区域...", parent=self, position=InfoBarPosition.TOP)
-             return
+        cache_path = self.line_cache.text().strip() or get_default_cache_dir()
+        if not os.path.exists(cache_path):
+            os.makedirs(cache_path, exist_ok=True)
         
         try:
             count = 0
@@ -1143,9 +1617,8 @@ class MainWindow(FluentWindow):
             InfoBar.error("净化失败", str(e), parent=self, position=InfoBarPosition.TOP)
 
     def start_task(self):
-        src = self.line_src.text()
-        if not src:
-            InfoBar.warning(title="提示", content="请先选择视频源文件夹！", orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, parent=self)
+        if not self.selected_files:
+            InfoBar.warning(title="提示", content="请先选择视频源文件夹或视频文件！", orient=Qt.Orientation.Horizontal, isClosable=True, position=InfoBarPosition.TOP, parent=self)
             return
 
         # 参数校验
@@ -1156,10 +1629,10 @@ class MainWindow(FluentWindow):
             return
 
         config = {
-            'src_dir': src,
+            'selected_files': self.selected_files[:],
             'encoder': self.combo_encoder.currentText(),
             'export_dir': self.line_export.text(),
-            'cache_dir': self.line_cache.text(),
+            'cache_dir': self.line_cache.text().strip() or get_default_cache_dir(),
             'overwrite': not self.sw_save_as.isChecked(), # 如果未开启"另存为"，则默认为覆盖
             'preset': self.combo_preset.text(),
             'vmaf': vmaf_val,
@@ -1168,6 +1641,7 @@ class MainWindow(FluentWindow):
             'shutdown': self.sw_shutdown.isChecked(),
             'nv_aq': self.sw_nv_aq.isChecked()
         }
+        os.makedirs(config['cache_dir'], exist_ok=True)
 
         self.worker = EncoderWorker(config)
         self.worker.log_signal.connect(self.log)
@@ -1240,6 +1714,30 @@ class MainWindow(FluentWindow):
         self.combo_encoder.setEnabled(True)
         self.worker = None
 
+    def apply_encoder_availability(self, has_qsv, has_nvenc, has_amf):
+        """根据自检结果启用/禁用魔力核心选项，返回自动切换到的后端名(若发生切换)。"""
+        mapping = [("Intel QSV", 0, has_qsv), ("NVIDIA NVENC", 1, has_nvenc), ("AMD AMF", 2, has_amf)]
+
+        for _, idx, enabled in mapping:
+            self.combo_encoder.setItemEnabled(idx, enabled)
+
+        available = [(name, idx) for name, idx, enabled in mapping if enabled]
+        if not available:
+            self.combo_encoder.setEnabled(False)
+            return None
+
+        # 仅当当前不在任务中时允许切换/启用
+        if not (self.worker and self.worker.isRunning()):
+            self.combo_encoder.setEnabled(True)
+
+        current = self.combo_encoder.currentText()
+        valid_names = {name for name, _ in available}
+        if current not in valid_names:
+            self.combo_encoder.setCurrentIndex(available[0][1])
+            return available[0][0]
+
+        return None
+
     def check_dependencies(self):
         """ 启动时检查依赖组件 (二次元风格) """
         missing = []
@@ -1275,6 +1773,7 @@ class MainWindow(FluentWindow):
             # 禁用开始按钮防止报错
             self.btn_start.setEnabled(False)
             self.btn_start.setText("🚫 缺少组件")
+            self.apply_encoder_availability(False, False, False)
             self.log(">>> 致命错误：关键组件缺失，系统已停摆。", "error")
         else:
             # 组件存在，进一步检查硬件兼容性
@@ -1291,6 +1790,7 @@ class MainWindow(FluentWindow):
                 # 2. 检查硬件层面是否支持 AV1 编码 (解决旧款 Intel 核显误报问题)
                 has_qsv = False
                 has_nvenc = False
+                has_amf = False
 
                 # 检测 Intel QSV (尝试硬件编码一帧)
                 if "av1_qsv" in enc_str:
@@ -1309,7 +1809,7 @@ class MainWindow(FluentWindow):
                         else:
                             err_msg = safe_decode(stderr)
                             if err_msg:
-                                self.log(f">>> Intel QSV 自检未通过: {err_msg.splitlines()[0]}", "warning")
+                                self.log(f">>> Intel QSV 自检未通过: {err_msg.splitlines()[0]}", "error")
                     except Exception as e:
                         self.log(f">>> Intel QSV 检测异常: {e}", "error")
 
@@ -1354,23 +1854,45 @@ class MainWindow(FluentWindow):
                     except Exception as e:
                         self.log(f">>> NVENC 检测异常: {e}", "error")
 
-                if not has_qsv and not has_nvenc:
-                    self.log(">>> 警告：未侦测到有效的 AV1 硬件编码器 (QSV/NVENC)。", "error")
+                # 检测 AMD AMF (尝试硬件编码一帧)
+                if "av1_amf" in enc_str:
+                    try:
+                        proc = subprocess.Popen(
+                            [ffmpeg_path, "-v", "error",
+                             "-f", "lavfi", "-i", "color=black:s=1280x720",
+                             "-pix_fmt", "p010le",
+                             "-c:v", "av1_amf", "-usage", "transcoding",
+                             "-quality", "balanced",
+                             "-rc", "cqp",
+                             "-qp_i", "30", "-qp_p", "30", "-qp_b", "30",
+                             "-frames:v", "1", "-f", "null", "-"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=subprocess.CREATE_NO_WINDOW if os.name=='nt' else 0
+                        )
+                        _, stderr = proc.communicate()
+                        if proc.returncode == 0:
+                            has_amf = True
+                        else:
+                            err_msg = safe_decode(stderr)
+                            if err_msg:
+                                short_err = err_msg.split('\n')[0]
+                                self.log(f">>> AMD AMF 自检未通过: {short_err}", "warning")
+                    except Exception as e:
+                        self.log(f">>> AMD AMF 检测异常: {e}", "error")
+
+                switched_to = self.apply_encoder_availability(has_qsv, has_nvenc, has_amf)
+
+                if not has_qsv and not has_nvenc and not has_amf:
+                    self.log(">>> 警告：未侦测到有效的 AV1 硬件编码器 (QSV/NVENC/AMF)。", "error")
                     InfoBar.warning("硬件不支持", "您的显卡似乎不支持 AV1 硬件编码，或者驱动未正确安装。", parent=self, position=InfoBarPosition.TOP)
                 else:
                     msg = ">>> 适格者认证通过："
                     if has_qsv: msg += " [Intel QSV]"
                     if has_nvenc: msg += " [NVIDIA NVENC]"
+                    if has_amf: msg += " [AMD AMF]"
                     self.log(msg + " (Ready)", "success")
-                    
-                    # 自动切换逻辑：如果当前选择的编码器不可用，自动切换到可用的那个
-                    current_enc = self.combo_encoder.currentText()
-                    if "Intel" in current_enc and not has_qsv and has_nvenc:
-                        self.combo_encoder.setCurrentIndex(1) # Switch to NVENC
-                        self.log(">>> 已自动切换至 NVIDIA NVENC 术式。", "info")
-                    elif "NVIDIA" in current_enc and not has_nvenc and has_qsv:
-                        self.combo_encoder.setCurrentIndex(0) # Switch to QSV
-                        self.log(">>> 已自动切换至 Intel QSV 术式。", "info")
+                    if switched_to:
+                        self.log(f">>> 已自动切换至 {switched_to} 术式。", "info")
                     
             except Exception as e:
                 self.log(f">>> 环境自检异常: {e}", "error")
