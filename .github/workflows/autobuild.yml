@@ -33,6 +33,8 @@ jobs:
           --enable-plugin=pyside6
           --assume-yes-for-downloads
           --windows-icon-from-ico=logo.ico
+          --include-data-file=logo.ico=logo.ico
+          --include-data-file=LingMoe404.ico=LingMoe404.ico
           --output-dir=build/nuitka
           --output-filename=魔法少女工坊.exe
 
