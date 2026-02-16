@@ -41,7 +41,7 @@
 | **FFmpeg 编码器** | `av1_qsv` | `av1_nvenc` | `av1_amf` |
 | **默认 VMAF 目标** | `93.0` | `95.0` | `97.0` |
 | **质量控制参数** | `-global_quality:v` | `-cq` | `-qp_p` |
-| **速度预设 (Preset)** | `1` (慢) - `7` (快) | `p1` (慢) - `p7` (快) | `speed` / `balanced` / `quality` |
+| **速度预设 (Preset)** | `1` (慢) - `7` (快) | `p7` (慢) - `p1` (快) | `quality` (慢) - `speed` (快) |
 | **码率控制模式** | 硬件 ICQ 模式 | `vbr` + `-b:v 0` | `cqp` 模式 |
 | **感知增强 (AQ)** | 默认启用 (Lookahead) | 默认启用 (Spatial/Temporal) | 默认启用 (Pre-Analysis) |
 | **像素格式** | `p010le` (10-bit) | `p010le` (10-bit) | `p010le` (10-bit) |
@@ -49,6 +49,7 @@
 | **硬件门槛** | Intel Arc / Core Ultra | NVIDIA RTX 40 系列 | AMD RX 7000 / RDNA 3 |
 
 *注：由于三家算法不同，相同的质量数值（如 30）在不同显卡上的表现不可直接类比，请以 VMAF 结果为准。*
+*预设映射：软件界面统一使用 `1` (慢/高质量) - `7` (快/低质量) 的数字，会自动映射为上表中的实际参数（例如选 `1` 时，N 卡对应 `p7`，A 卡对应 `quality`）。*
 
 ## 🧪 VMAF 调优指南
 
